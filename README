@@ -1,0 +1,48 @@
+
+				pmusage
+
+This is a script for generating a perl module usage graph.
+For example, to find out what modules end up getting loaded
+when you use Net::FTP, run the following:
+
+	% pmusage -format dot Net:FTP
+
+pmusage can generate four different graph formats:
+
+	vcg - used by the VCG tool
+	dot - used by the dot tool, which is part of the graphviz toolkit
+	davinci - used by daVinci
+	xml - a simple xml format for storing directed graphs
+
+The script is fully documented using pod. Once installed you should get
+a man page. It also supports two informational switches:
+
+	-help	display a short help message describing command-line options
+	-doc	display the complete pod documentation for pmusage
+
+The script requires several modules from CPAN. You can get the latest
+version from www.cpan.org
+
+    What		Where
+
+    Graph		Jarkko's Graph class
+				$CPAN/authors/id/JHI/
+
+    Graph-ReadWrite	modules for reading+writing different graph formats
+				$CPAN/authors/id/NEILB/
+
+    AppConfig::Std	used for configuration parameters
+				$CPAN/authors/id/NEILB/
+
+    AppConfig		AppConfig::Std is a subclass of this module
+				$CPAN/authors/id/ABW/
+
+
+This is an early version of a work in progress -
+I'd be happy to hear of any suggestions for improving this script.
+
+Neil Bowers <neilb@cre.canon.co.uk>
+Canon Research Centre Europe
+http://www.cre.canon.co.uk/
+--
+$Id: README,v 1.1.1.1 2001/03/14 12:12:01 neilb Exp $

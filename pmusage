@@ -1,0 +1,526 @@
+#!/apps/perl5/bin/perl -w
+#
+# pmusage - generate a usage graph for a perl module
+#
+
+use strict;
+use vars qw($VERSION $PROGRAM);
+
+use IO::File;
+use Graph;
+use AppConfig::Std;
+
+$VERSION = sprintf("%d.%d", q$Revision: 1.2 $ =~ /(\d+)\.(\d+)/);
+
+my %formats =
+(
+    dot     => 'Graph::Writer::Dot',
+    vcg     => 'Graph::Writer::VCG',
+    xml     => 'Graph::Writer::XML',
+    davinci => 'Graph::Writer::daVinci',
+);
+
+my %seen;
+my %used_by;
+my @classes;
+my %class_nodes = ();
+my $graph;
+my $node_num = 0;
+my $config;
+
+
+main();
+exit 0;
+
+#=======================================================================
+#
+# main()
+#
+#=======================================================================
+sub main
+{
+    initialise();
+
+    _verbose("processing modules:\n");
+    @classes = @ARGV;
+    while (@classes > 0)
+    {
+	process_module(shift @classes);
+    }
+    output_graph();
+}
+
+#=======================================================================
+#
+# output_graph()
+#
+# output the graph in the selected format
+#
+#=======================================================================
+sub output_graph
+{
+    my $writer;
+    my $class;
+    my $filename;
+
+
+    $class = $formats{$config->format};
+    eval "use $class";
+    $writer = new $class;
+    $filename = $config->o ? $config->o : 'usage.'.$config->format;
+
+    _verbose("writing graph to $filename\n");
+    $writer->write_graph($graph, $filename);
+}
+
+#=======================================================================
+#
+# process_module()
+#
+# Given a module name, find the file for it, and process the contents
+# looking for classes that it uses.
+#
+#=======================================================================
+sub process_module
+{
+    my $class = shift;
+
+    my $package = $class;
+
+    my $relpath;
+    my $FILE;
+    my $fullpath;
+    my $inpod = 0;
+    local $_;
+
+
+    return if (exists $seen{$class});
+    $seen{$class}++;
+
+    #-------------------------------------------------------------------
+    # Find the first instance of the module in @INC
+    # (we could look and see if there's more than one, and warn if so)
+    #-------------------------------------------------------------------
+    ($relpath = $class) =~ s!::!/!g;
+    foreach my $dir (@INC)
+    {
+	if (-f "$dir/$relpath.pm")
+	{
+	    $fullpath = "$dir/$relpath.pm";
+	    last;
+	}
+    }
+    if (not defined $fullpath)
+    {
+	warn "  couldn't find $class\n";
+	return;
+    }
+
+    #-------------------------------------------------------------------
+    # Process the file, looking for usage of other modules
+    #-------------------------------------------------------------------
+    _verbose("  $class\n");
+    _debug("    ($fullpath)\n");
+
+    $FILE = IO::File->new("< $fullpath");
+    if (not defined $FILE)
+    {
+	warn "failed to read $fullpath: $!\n";
+	return;
+    }
+    while (<$FILE>)
+    {
+	#---------------------------------------------------------------
+	# anything after __DATA__ and __END__ symbols is ignored
+	#---------------------------------------------------------------
+	last if /^__DATA__/ || /^__END__/;
+
+	#---------------------------------------------------------------
+	# ignore pod, so we don't get fooled by the SYNOPSIS section
+	# and example code, for example.
+	#---------------------------------------------------------------
+	if (/^=(\S+)/)
+	{
+	    if ($1 eq 'cut')
+	    {
+		$inpod = 0;
+	    }
+	    else
+	    {
+		$inpod = 1;
+	    }
+	}
+	next if $inpod;
+
+	#---------------------------------------------------------------
+	# use of classes. any eval'ing of classes will fool us.
+	# As will things like:
+	#	use Foo; use Bar;
+	#---------------------------------------------------------------
+	if (/^\s*use\s+([^\s;()]+)/ || /^\s*require\s+([^\s;()'"]+)/)
+	{
+	    class_uses($package, $1);
+	}
+
+	#---------------------------------------------------------------
+	# Deal with multiple packages (classes) in one file. Eg:
+	#
+	#	package IO::Socket;
+	#	...
+	#	package IO::Socket::INET;
+	#	...
+	#	package IO::Socket::UNIX;
+	#	...
+	#
+	# The 2nd and 3rd package statements define classes used by
+	# IO::Socket. Any use's or require's after the package
+	# statements are used by those classes and not IO::Socket.
+	#---------------------------------------------------------------
+        if (/^\s*package\s+([^\s;()''""]+)/ && $1 ne $class)
+        {
+            $package = $1;
+            class_uses($class, $package, 1);
+        }
+
+    }
+    $FILE->close();
+}
+
+#=======================================================================
+#
+# class_uses()
+#
+# Record that module $source uses module $used.
+#
+#=======================================================================
+sub class_uses
+{
+    my $source  = shift;
+    my $used    = shift;
+    my $nested  = @_ > 0 ? shift : 0;
+    my ($from, $to);
+
+
+    #-------------------------------------------------------------------
+    # Ignore perl version being required, and pragma unless -pragmas
+    #-------------------------------------------------------------------
+    return if ($used =~ /^[0-9._]+$/);
+    return if ($used =~ /^[a-z]/ && !$config->pragmas);
+
+    #-------------------------------------------------------------------
+    # Get graph node id's for the two modules
+    #-------------------------------------------------------------------
+    $from = class_node($source);
+    $to   = class_node($used);
+
+    #-------------------------------------------------------------------
+    # ignore multiple usages. We could add a flag to override this,
+    # resulting in multiple edges in the graph.
+    #-------------------------------------------------------------------
+    return if $graph->has_edge($from => $to);
+
+    #-------------------------------------------------------------------
+    # record the usage in the graph
+    #-------------------------------------------------------------------
+    _debug("    -> $used\n");
+    $graph->add_edge($from, $to);
+
+    #-------------------------------------------------------------------
+    # Add the used module to the list we need to process
+    #-------------------------------------------------------------------
+    push(@classes, $used) if (not $nested);
+}
+
+#=======================================================================
+#
+# class_node()
+#
+# Given the name of a class (eg "IO::File") returns the node
+# identifier for that class.
+#
+#=======================================================================
+sub class_node
+{
+    my $class = shift;
+    my $id;
+
+
+    #-------------------------------------------------------------------
+    # If we haven't seen the class before, then create a new node
+    # and set the label attribute. We have a hash providing the
+    # mapping between class name and node id.
+    #-------------------------------------------------------------------
+    if (!exists $class_nodes{$class})
+    {
+	$id = sprintf("n%.3d", $node_num);
+	$graph->add_vertex($id);
+	if ($config->format eq 'davinci')
+	{
+	    $graph->set_attribute('OBJECT', $id, $class);
+	}
+	else
+	{
+	    $graph->set_attribute('label', $id, $class);
+	}
+	$class_nodes{$class} = $id;
+	++$node_num;
+    }
+
+    #-------------------------------------------------------------------
+    # return the identifier for the node in the graph representing
+    # the class
+    #-------------------------------------------------------------------
+    return $class_nodes{$class};
+}
+
+#=======================================================================
+#
+# initialise()
+#
+# handle switches and config
+#
+#=======================================================================
+sub initialise
+{
+    my $class;
+
+
+    #-------------------------------------------------------------------
+    # name of the program, used in verbose and debugging output, etc
+    #-------------------------------------------------------------------
+    ($PROGRAM = $0) =~ s!^.*/!!;
+
+    #-------------------------------------------------------------------
+    # create config object, define our options, and process ARGV
+    #-------------------------------------------------------------------
+    $config = AppConfig::Std->new();
+    $config->define('format', { ARGCOUNT => 1 });
+    $config->define('o', { ARGCOUNT => 1 });
+    $config->define('pragmas', { ARGCOUNT => 0, ALIAS => 'p' });
+    $config->define('verbose', { ARGCOUNT => 0, ALIAS => 'p' });
+
+    $config->args(\@ARGV)
+	|| die "run \"$PROGRAM -help\" for supported options\n";
+
+    $config->verbose(1) if $config->debug && !$config->verbose;
+
+    #-------------------------------------------------------------------
+    # check that a valid file format has been specified for output
+    #-------------------------------------------------------------------
+    if (not $config->format)
+    {
+	die "you must specify an output format (-format): ",
+	    "one of ", join(', ', keys %formats), "\n";
+    }
+    elsif (not exists $formats{$config->format})
+    {
+	die "supported graph formats are: ", join(", ", keys %formats), "\n";
+    }
+
+    #-------------------------------------------------------------------
+    # Create the Graph
+    #-------------------------------------------------------------------
+    if (not defined($graph = Graph->new))
+    {
+	die "failed to created Graph\n";
+    }
+
+    #-------------------------------------------------------------------
+    # banner
+    #-------------------------------------------------------------------
+    _verbose("$PROGRAM v$VERSION\n");
+}
+
+#=======================================================================
+#
+# _verbose()
+#
+# print out message if -verbose was given
+#
+# hmm, i seem to be putting one of these in all my scripts these days
+# will have to think about putting this in AppConfig::Std
+#
+#=======================================================================
+sub _verbose
+{
+    return unless $config->verbose;
+    print join('', @_);
+}
+
+#=======================================================================
+#
+# _debug()
+#
+# print out message if -debug was given
+#
+# hmm, i seem to be putting one of these in all my scripts these days
+# will have to think about putting this in AppConfig::Std
+#
+#=======================================================================
+sub _debug
+{
+    return unless $config->debug;
+    print join('', @_);
+}
+
+__END__
+
+=head1 NAME
+
+pmusage - generate usage graph for a perl module
+
+=head1 SYNOPSIS
+
+B<pmusage> [OPTIONS] I<class>
+
+=head1 DESCRIPTION
+
+B<pmusage> creates usage graphs for Perl modules.
+The graph is constructed as a directed graph, and
+output in one of the following formats:
+
+=over 4
+
+=item Dot
+
+The file format used by B<dot>, which is part of the
+AT&T graphviz package.
+
+=item VCG
+
+The file format used by B<vcg>, a tool originally created
+for visualising compiler graphs.
+
+=item daVinci
+
+The file format used by B<daVinci>, a tool for visualising
+graphs, and interactively creating them.
+
+=item XML
+
+A simple XML file format used for representing directed
+graphs created using the perl B<Graph> class.
+
+=back
+
+The following example shows how you might generate and view the usage
+graph for the C<Net::FTP> module:
+
+    % pmusage -format dot Net::FTP
+    % dot -Tps -o usage.ps usage.dot
+    % ghostview usage.ps
+
+By default the graph is written to a file called B<usage>,
+with an extension that identifies the format.
+You can specify the output filename explicitly using the B<-o> switch:
+
+    % pmusage -format vcg -o ftp.vcg Net::FTP
+    % xvcg ftp.vcg
+
+B<pmusage> will ignore pragmas (eg C<strict> and C<vars>)
+unless you use the B<-pragmas> option:
+
+    % pmusage -pragmas -format dot GIFgraph
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-format> I<id>
+
+The file format for the usage graph.
+
+=item B<-o> I<filename>
+
+The file to write the graph to. Defaults to B<usage.>I<format>.
+
+=item B<-pragmas>
+
+Pragmas, like C<strict>, should be included in the graph.
+
+=item B<-help>
+
+Display a short help message including command-line options.
+
+=item B<-doc>
+
+Display the full documentation for B<pmusage>.
+
+=item B<-version>
+
+Display the version of B<pmusage>.
+
+=item B<-verbose>
+
+Display verbose information as B<pmusage> runs.
+
+=item B<-debug>
+
+Display debugging information as B<pmusage> runs.
+
+=back
+
+=head1 KNOWN BUGS AND LIMITATIONS
+
+=over 4
+
+=item *
+
+B<pmusage> uses simple regex matching to find
+what modules are used by a specific module.
+This could easily be confused.
+
+=item *
+
+Doesn't currently generate an inheritance graph,
+which would also be handy.
+I plan to fix that soon.
+
+=item *
+
+The table of supported formats is currently hardcoded
+in this script. We could dynamically create the table
+based on what C<Graph::Writer::> classes you have installed.
+
+=back
+
+=head1 SEE ALSO
+
+=over 4
+
+=item Graph-ReadWrite
+
+A collection of classes for reading and writing directed
+graphs in various file formats. Available from CPAN.
+
+=item Graph
+
+The class used to represent the directed graph. Available from CPAN.
+
+=item http://www.graphviz.org/
+
+The home page for the AT&T graphviz toolkit, which includes the B<dot> tool.
+
+=item http://www.cs.uni-sb.de/RW/users/sander/html/gsvcg1.html
+
+The home page for VCG, a tool for visualising compiler graphs.
+
+=back
+
+=head1 VERSION
+
+$Revision: 1.2 $
+
+=head1 AUTHOR
+
+Neil Bowers <neilb@cre.canon.co.uk>
+
+=head1 COPYRIGHT
+
+Copyright (C) 2001 Canon Research Centre Europe. All rights reserved.
+
+This script is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself.
+
+=cut
+
